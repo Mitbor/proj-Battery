@@ -1,4 +1,4 @@
-// EcoFlow River 2 — battery level indicator in the Windows system tray.
+// EcoFlow power station (River 2, Delta 2, Delta 3 ...) — battery level indicator in the Windows system tray.
 // Data comes from the official EcoFlow Open API (https://developer.ecoflow.com).
 // Build: build.bat (needs only .NET Framework 4.x, which ships with Windows 10/11).
 
@@ -94,28 +94,34 @@ namespace EcoFlowTray
         public bool Online = true;
         public bool Live;            // true — data from the MQTT stream, false — cloud cache snapshot (may be stale)
         public bool Charging;
-        public string Name = "River 2";
+        public string Name = "EcoFlow";
         public DateTime Time = DateTime.Now;
 
-        // Builds the state from a flat dictionary of parameters like "pd.soc", "inv.inputWatts", etc.
+        // Builds the state from a flat dictionary of parameters. Two key families are supported:
+        //  - River 2 / Delta 2 generation: prefixed keys like "pd.soc", "inv.inputWatts", "bms_emsStatus.chgRemainTime";
+        //  - Delta 3 / Delta Pro 3 / River 3 generation: flat keys like "cmsBattSoc", "powInSumW", "cmsChgRemTime".
         public static BatteryState From(Dictionary<string, object> q)
         {
             var st = new BatteryState();
-            st.Soc = Int(q, "pd.soc", "bms_bmsStatus.soc", "bms_emsStatus.lcdShowSoc", "bms_emsStatus.f32LcdShowSoc");
-            st.WattsOut = Int(q, "pd.wattsOutSum", "inv.outputWatts");
-            st.WattsIn = Int(q, "pd.wattsInSum");
+            st.Soc = Int(q, "pd.soc", "cmsBattSoc", "bms_bmsStatus.soc", "bmsBattSoc",
+                         "bms_emsStatus.lcdShowSoc", "bms_emsStatus.f32LcdShowSoc");
+            st.WattsOut = Int(q, "pd.wattsOutSum", "powOutSumW", "inv.outputWatts");
+            st.WattsIn = Int(q, "pd.wattsInSum", "powInSumW");
             if (st.WattsIn < 0)
             {
-                // River 2 does not send wattsInSum over MQTT — add up AC input and MPPT input (solar/car)
-                int ac = Int(q, "inv.inputWatts"), dc = Int(q, "mppt.inWatts");
+                // River 2 / Delta 2 do not send wattsInSum over MQTT — add up AC input and MPPT input (solar/car);
+                // new generation: AC input + PV input
+                int ac = Int(q, "inv.inputWatts", "powGetAcIn"), dc = Int(q, "mppt.inWatts", "powGetPv");
                 if (ac >= 0 || dc >= 0) st.WattsIn = Math.Max(0, ac) + Math.Max(0, dc);
             }
             int bIn = Int(q, "bms_bmsStatus.inputWatts"), bOut = Int(q, "bms_bmsStatus.outputWatts");
-            st.Charging = (bIn >= 0 && bOut >= 0) ? bIn > bOut + 5 : (st.WattsIn > 5 && st.WattsIn >= st.WattsOut);
+            st.Charging = (bIn >= 0 && bOut >= 0) ? bIn > bOut + 5 : (st.WattsIn > 5 && st.WattsIn > st.WattsOut + 5);
             if (st.Soc >= 100) st.Charging = false;   // at 100 % it is only trickle charging; mains powers the load directly
 
             // 5999 min is EcoFlow's placeholder for "not calculated"
-            int chg = Int(q, "bms_emsStatus.chgRemainTime"), dsg = Int(q, "bms_emsStatus.dsgRemainTime"), pdRem = Int(q, "pd.remainTime");
+            int chg = Int(q, "bms_emsStatus.chgRemainTime", "cmsChgRemTime", "bmsChgRemTime");
+            int dsg = Int(q, "bms_emsStatus.dsgRemainTime", "cmsDsgRemTime", "bmsDsgRemTime");
+            int pdRem = Int(q, "pd.remainTime");
             bool pdRemKnown = q.ContainsKey("pd.remainTime");
             st.ChargeMin = chg > 0 && chg < 5999 ? chg : (pdRemKnown && pdRem > 0 ? pdRem : -1);
             st.DischargeMin = dsg > 0 && dsg < 5999 ? dsg : (pdRemKnown && pdRem < 0 && pdRem != -1 ? -pdRem : -1);
@@ -202,6 +208,8 @@ namespace EcoFlowTray
             var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             var d = js.Deserialize<Dictionary<string, object>>(body);
             string code = d.ContainsKey("code") ? Convert.ToString(d["code"]) : "?";
+            if (code == "1006")
+                throw new Exception("EcoFlow does not allow this model in the Open API (code 1006) — the app cannot read it");
             if (code != "0")
                 throw new Exception("EcoFlow API: " + (d.ContainsKey("message") ? Convert.ToString(d["message"]) : body) + " (code " + code + ")");
             return d;
@@ -216,15 +224,21 @@ namespace EcoFlowTray
             return list;
         }
 
-        // If no serial number is set, take the first River on the account and remember it.
+        // If no serial number is set, take the first power station (River/Delta) on the account and remember it.
         public void EnsureSerial()
         {
             if (cfg.SerialNumber.Length > 0) return;
             var devs = ListDevices();
-            var dev = devs.FirstOrDefault(x => Convert.ToString(GetOr(x, "productName", "")).ToUpperInvariant().Contains("RIVER")) ?? devs.FirstOrDefault();
+            var dev = devs.FirstOrDefault(IsStation) ?? devs.FirstOrDefault();
             if (dev == null) throw new Exception("No devices are linked to this account");
             cfg.SerialNumber = Convert.ToString(dev["sn"]);
             try { cfg.Save(); } catch { }
+        }
+
+        public static bool IsStation(Dictionary<string, object> dev)
+        {
+            string pn = Convert.ToString(GetOr(dev, "productName", "")).ToUpperInvariant();
+            return pn.Contains("RIVER") || pn.Contains("DELTA") || pn.Contains("TRAIL");
         }
 
         // Snapshot from the cloud cache. WARNING: the cloud refreshes it rarely (hours apart), so this is
@@ -385,10 +399,20 @@ namespace EcoFlowTray
             finally { pinger.Dispose(); }
         }
 
+        bool loggedSample;
+
         void Handle(Dictionary<string, object> msg)
         {
-            var p = EcoFlowApi.GetOr(msg, "params", null) as Dictionary<string, object>;
+            // River 2 / Delta 2 use "params"; some newer models use "param"
+            var p = (EcoFlowApi.GetOr(msg, "params", null) ?? EcoFlowApi.GetOr(msg, "param", null)) as Dictionary<string, object>;
             if (p == null || p.Count == 0) return;
+            if (!loggedSample)
+            {
+                // one sample per session — helps to add support for an unfamiliar model from the user's log
+                loggedSample = true;
+                Log.Write("MQTT sample (" + Convert.ToString(EcoFlowApi.GetOr(msg, "typeCode", "no typeCode")) + "): " +
+                          string.Join(", ", p.Keys.Take(40).ToArray()));
+            }
             string type = Convert.ToString(EcoFlowApi.GetOr(msg, "typeCode", ""));
             string prefix;
             switch (type)
@@ -403,8 +427,8 @@ namespace EcoFlowTray
             var outp = new Dictionary<string, object>();
             foreach (var kv in p)
             {
-                if (kv.Key.Contains(".")) outp[kv.Key] = kv.Value;          // already a full key
-                else if (prefix.Length > 0) outp[prefix + kv.Key] = kv.Value;
+                if (kv.Key.Contains(".") || prefix.Length == 0) outp[kv.Key] = kv.Value;   // full key, or new-generation flat key
+                else outp[prefix + kv.Key] = kv.Value;
             }
             if (outp.Count > 0) Fire(Params, outp);
         }
@@ -480,7 +504,7 @@ namespace EcoFlowTray
         DateTime liveTime = DateTime.MinValue;
         bool liveDirty, wasLive;
         string liveError;
-        string deviceName = "River 2";
+        string deviceName = "EcoFlow";
         LiveFeed feed;
         readonly System.Windows.Forms.Timer uiTimer = new System.Windows.Forms.Timer { Interval = 1000 };
 
@@ -506,7 +530,7 @@ namespace EcoFlowTray
             tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) OnLeftClick(); };
             tray.DoubleClick += (s, e) => ShowSettings();
             SetIcon(null, "…");
-            tray.Text = "EcoFlow River 2";
+            tray.Text = "EcoFlow";
             tray.Visible = true;
 
             // fallback cloud polling — runs only while there is no live stream
@@ -647,7 +671,7 @@ namespace EcoFlowTray
             if (!st.Charging && st.Soc <= cfg.LowThreshold && !lowWarned)
             {
                 lowWarned = true;
-                tray.ShowBalloonTip(8000, "EcoFlow River 2", "Low battery: " + st.Soc + "%", ToolTipIcon.Warning);
+                tray.ShowBalloonTip(8000, st.Name, "Low battery: " + st.Soc + "%", ToolTipIcon.Warning);
             }
             if (st.Soc > cfg.LowThreshold + 5 || st.Charging) lowWarned = false;
         }
@@ -779,7 +803,7 @@ namespace EcoFlowTray
 
         public SettingsForm(Config c)
         {
-            Text = "EcoFlow River 2 — Settings";
+            Text = "EcoFlow Tray — Settings";
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -827,7 +851,7 @@ namespace EcoFlowTray
 
             Controls.Add(new Label
             {
-                Text = "Leave the serial number empty to use the first River on the account. Server: api-e — Europe, api-a — Americas.",
+                Text = "Leave the serial number empty to use the first power station on the account. Server: api-e — Europe, api-a — Americas.",
                 Location = new Point(12, y), Size = new Size(446, 34), ForeColor = SystemColors.GrayText
             });
 
@@ -879,7 +903,7 @@ namespace EcoFlowTray
                     sb.AppendLine(Convert.ToString(d.ContainsKey("sn") ? d["sn"] : "") + "  —  " +
                                   Convert.ToString(d.ContainsKey("productName") ? d["productName"] : (d.ContainsKey("deviceName") ? d["deviceName"] : "")) +
                                   (Convert.ToString(d.ContainsKey("online") ? d["online"] : "") == "1" ? "  (online)" : "  (offline)"));
-                var pick = devs.FirstOrDefault(x => Convert.ToString(x.ContainsKey("productName") ? x["productName"] : "").ToUpperInvariant().Contains("RIVER")) ?? devs[0];
+                var pick = devs.FirstOrDefault(EcoFlowApi.IsStation) ?? devs[0];
                 tbSn.Text = Convert.ToString(pick["sn"]);
                 MessageBox.Show(this, "Found:\n\n" + sb + "\nSelected: " + tbSn.Text, Text);
             }
