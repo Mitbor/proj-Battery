@@ -17,7 +17,7 @@ final class MQTTFeed {
     private var topic = ""
     private var loggedSample = false
 
-    func connect(host: String, port: UInt16, user: String, password: String, topic: String) {
+    func connect(host: String, port: UInt16, user: String, password: String, clientId: String, topic: String) {
         self.topic = topic
         let params = NWParameters(tls: NWProtocolTLS.Options(), tcp: NWProtocolTCP.Options())
         guard let p = NWEndpoint.Port(rawValue: port) else { finish("bad broker port"); return }
@@ -27,9 +27,8 @@ final class MQTTFeed {
             guard let self else { return }
             switch state {
             case .ready:
-                let clientId = user + "_tray_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10)
                 // CONNECT (clean session, user+password, keepalive 60 s)
-                self.send(0x10, self.str("MQTT") + [4, 0xC2, 0, 60] + self.str(String(clientId)) + self.str(user) + self.str(password))
+                self.send(0x10, self.str("MQTT") + [4, 0xC2, 0, 60] + self.str(clientId) + self.str(user) + self.str(password))
                 self.startPinger()
                 self.receive()
             case .failed(let e):
@@ -106,6 +105,7 @@ final class MQTTFeed {
             send(0x82, [0, 1] + str(topic) + [1])
         case 9: // SUBACK
             if body.count >= 3, body[2] == 0x80 { finish("subscription rejected"); return }
+            AppLog.write("MQTT: logged in and subscribed to \(topic)")
             onSubscribed?()
         case 3: // PUBLISH
             guard body.count >= 2 else { return }
@@ -129,7 +129,7 @@ final class MQTTFeed {
         if !loggedSample {
             // one sample per session — helps to add support for an unfamiliar model
             loggedSample = true
-            NSLog("EcoFlowTray MQTT sample (%@): %@", "\(msg["typeCode"] ?? "no typeCode")", p.keys.sorted().prefix(40).joined(separator: ", "))
+            AppLog.write("MQTT sample (\(msg["typeCode"] ?? "no typeCode")): " + p.keys.sorted().prefix(40).joined(separator: ", "))
         }
         let prefix: String
         switch "\(msg["typeCode"] ?? "")" {

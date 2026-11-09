@@ -12,10 +12,12 @@ final class BatteryModel: ObservableObject {
     @Published var status = "Starting…"
     @Published var settings = AppSettings.load()
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var liveError: String?        // why there is no live stream right now (shown under the cloud cache data)
 
     private let liveStaleSec: TimeInterval = 120
     private var live: [String: Any] = [:]
     private var lastLive = Date.distantPast
+    private var liveStarted = Date.distantPast   // when the current MQTT session was opened
     private var feed: MQTTFeed?
     private var generation = 0               // ignores callbacks from a feed that was replaced
     private var reconnectDelay: TimeInterval = 5
@@ -48,11 +50,19 @@ final class BatteryModel: ObservableObject {
     func restart() {
         generation += 1
         feed?.stop(); feed = nil
-        live = [:]; lastLive = .distantPast; reconnectDelay = 5
+        live = [:]; lastLive = .distantPast; reconnectDelay = 5; liveStarted = .distantPast
         guard settings.isComplete else { status = "Open Settings and enter your EcoFlow keys"; return }
         status = "Connecting…"
+        liveError = "Connecting to the live stream…"
         Task { await fetchSnapshot() }
         connectLive()
+    }
+
+    // "Refresh now": re-reads the cloud snapshot and reconnects the live stream.
+    // While the live stream works the data is already current, so there is nothing to do.
+    func refreshNow() {
+        guard settings.isComplete, !liveFresh else { return }
+        restart()
     }
 
     private func tick() {
@@ -62,6 +72,14 @@ final class BatteryModel: ObservableObject {
             lastLive = .distantPast
             status = "No live data for \(Int(liveStaleSec)) s, reconnecting…"
             restart()
+            return
+        }
+        if lastLive == .distantPast && liveStarted != .distantPast
+            && Date().timeIntervalSince(liveStarted) > liveStaleSec {
+            // connected (or still connecting) but the station never sent anything — try again
+            liveStarted = .distantPast
+            feed?.stop(); feed = nil
+            liveClosed("the station sent no live data for \(Int(liveStaleSec)) s (is it switched on and online?)", gen: generation)
             return
         }
         if !liveFresh && Date().timeIntervalSince(lastFallback) >= TimeInterval(settings.intervalSec) {
@@ -115,6 +133,9 @@ final class BatteryModel: ObservableObject {
                 let pass = "\(cert["certificatePassword"] ?? "")"
                 let host = "\(cert["url"] ?? "")"
                 let port = UInt16("\(cert["port"] ?? 8883)") ?? 8883
+                AppLog.write("MQTT: cert fields \(cert.keys.sorted()), broker \(host):\(port), protocol \(cert["protocol"] ?? "-"), " +
+                             "account \(user.prefix(6))… (\(user.count) chars), password \(pass.count) chars, " +
+                             "client id \(Self.mqttClientId(account: user).count) chars, sn \(sn)")
 
                 let f = MQTTFeed()
                 f.onParams = { [weak self] p in
@@ -123,18 +144,42 @@ final class BatteryModel: ObservableObject {
                 f.onClosed = { [weak self] reason in
                     Task { @MainActor in self?.liveClosed(reason, gen: gen) }
                 }
+                f.onSubscribed = { [weak self] in
+                    Task { @MainActor in
+                        guard let self, gen == self.generation, !self.liveFresh else { return }
+                        self.liveError = "Connected, waiting for data from the station…"
+                    }
+                }
                 feed = f
-                f.connect(host: host, port: port, user: user, password: pass, topic: "/open/\(user)/\(sn)/quota")
+                liveStarted = Date()
+                f.connect(host: host, port: port, user: user, password: pass,
+                          clientId: Self.mqttClientId(account: user), topic: "/open/\(user)/\(sn)/quota")
             } catch {
                 liveClosed(error.localizedDescription, gen: gen)
             }
         }
     }
 
+    // EcoFlow limits how many distinct MQTT client IDs one account may use; once the limit is hit the broker
+    // answers CONNACK code 5 ("not authorized"). So the client ID is generated once and reused forever.
+    private static func mqttClientId(account: String) -> String {
+        let d = UserDefaults.standard
+        let id: String
+        if let saved = d.string(forKey: "mqttClientSuffix"), !saved.isEmpty {
+            id = saved
+        } else {
+            id = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10))
+            d.set(id, forKey: "mqttClientSuffix")
+        }
+        return account + "_mac_" + id
+    }
+
     private func liveClosed(_ reason: String, gen: Int) {
         guard gen == generation else { return }
-        NSLog("EcoFlowTray MQTT: %@", reason)
+        AppLog.write("MQTT: " + reason)
         if !liveFresh { status = "No live data: \(reason)" }
+        liveError = "No live data: \(reason)"
+        liveStarted = .distantPast           // the "silent session" check restarts with the next connection
         let delay = reconnectDelay
         reconnectDelay = min(120, reconnectDelay * 2)
         Task {
@@ -149,6 +194,7 @@ final class BatteryModel: ObservableObject {
         for (k, v) in p { live[k] = v }
         lastLive = Date()
         reconnectDelay = 5
+        liveError = nil
         guard var s = BatterySnapshot.from(live, name: deviceName, live: true) else { return }   // first packets may lack the level
         s.updated = lastLive
         show(s)

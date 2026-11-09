@@ -60,11 +60,23 @@ struct MenuContent: View {
                 if !s.timeText.isEmpty { Text(s.timeText).foregroundStyle(.secondary) }
                 Text(s.live ? "Updated \(s.updated.formatted(date: .omitted, time: .standard))" : model.status)
                     .font(.caption).foregroundStyle(.secondary)
+                if !s.live, let e = model.liveError {
+                    Text(e).font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 Text(model.status).foregroundStyle(.secondary)
             }
 
             Divider()
+
+            Button {
+                model.refreshNow()
+            } label: {
+                Label("Refresh now", systemImage: "arrow.clockwise")
+            }
+            .disabled(!model.settings.isComplete || model.liveFresh)
+            .help(model.liveFresh ? "Live data is already arriving every few seconds" : "Re-read the cloud and reconnect the live stream")
 
             Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin },
                                                     set: { model.setLaunchAtLogin($0) }))

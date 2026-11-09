@@ -35,6 +35,7 @@ namespace EcoFlowTray
         public string Host = "https://api-e.ecoflow.com";
         public int IntervalSec = 60;
         public int LowThreshold = 20;
+        public string MqttClientSuffix = "";   // generated once, see MqttClientId
 
         static string Dir { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "EcoFlowTray"); } }
         static string FilePath { get { return Path.Combine(Dir, "config.json"); } }
@@ -55,6 +56,7 @@ namespace EcoFlowTray
                 int i;
                 if (int.TryParse(Str(d, "intervalSec"), out i) && i >= 10) c.IntervalSec = i;
                 if (int.TryParse(Str(d, "lowThreshold"), out i) && i >= 0 && i <= 100) c.LowThreshold = i;
+                c.MqttClientSuffix = Str(d, "mqttClientSuffix");
             }
             catch { }
             return c;
@@ -65,8 +67,21 @@ namespace EcoFlowTray
             Directory.CreateDirectory(Dir);
             var d = new Dictionary<string, object> {
                 { "accessKey", AccessKey }, { "secretKey", Protect(SecretKey) }, { "sn", SerialNumber },
-                { "host", Host }, { "intervalSec", IntervalSec }, { "lowThreshold", LowThreshold } };
+                { "host", Host }, { "intervalSec", IntervalSec }, { "lowThreshold", LowThreshold },
+                { "mqttClientSuffix", MqttClientSuffix } };
             File.WriteAllText(FilePath, new JavaScriptSerializer().Serialize(d), Encoding.UTF8);
+        }
+
+        // EcoFlow limits how many distinct MQTT client IDs one account may use; once the limit is hit the broker
+        // answers CONNACK code 5 ("not authorized"). So the client ID is generated once and reused forever.
+        public string MqttClientId(string account)
+        {
+            if (MqttClientSuffix.Length == 0)
+            {
+                MqttClientSuffix = Guid.NewGuid().ToString("N").Substring(0, 10);
+                try { Save(); } catch { }
+            }
+            return account + "_win_" + MqttClientSuffix;
         }
 
         static string Str(Dictionary<string, object> d, string k) { object v; return d.TryGetValue(k, out v) && v != null ? v.ToString() : ""; }
@@ -361,7 +376,7 @@ namespace EcoFlowTray
             // CONNECT (clean session, user+password, keepalive 60 s)
             var m = new MemoryStream();
             Str(m, "MQTT"); m.WriteByte(4); m.WriteByte(0xC2); m.WriteByte(0); m.WriteByte(60);
-            Str(m, acc + "_tray_" + Guid.NewGuid().ToString("N").Substring(0, 10));
+            Str(m, cfg.MqttClientId(acc));
             Str(m, acc); Str(m, pwd);
             Send(0x10, m.ToArray());
 
@@ -800,9 +815,11 @@ namespace EcoFlowTray
         TextBox tbAccess, tbSecret, tbSn;
         ComboBox cbHost;
         NumericUpDown nuInterval, nuLow;
+        readonly string mqttClientSuffix;   // not editable, carried over so the MQTT client ID stays the same
 
         public SettingsForm(Config c)
         {
+            mqttClientSuffix = c.MqttClientSuffix;
             Text = "EcoFlow Tray — Settings";
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = MinimizeBox = false;
@@ -885,7 +902,8 @@ namespace EcoFlowTray
                 SerialNumber = tbSn.Text.Trim(),
                 Host = cbHost.Text.Trim().Length > 0 ? cbHost.Text.Trim().TrimEnd('/') : "https://api-e.ecoflow.com",
                 IntervalSec = (int)nuInterval.Value,
-                LowThreshold = (int)nuLow.Value
+                LowThreshold = (int)nuLow.Value,
+                MqttClientSuffix = mqttClientSuffix
             };
         }
 
